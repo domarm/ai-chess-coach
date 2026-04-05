@@ -1,130 +1,135 @@
 import asyncio
+import json
+import os
 from contextlib import asynccontextmanager
-from typing import List, Optional
-from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import chess
 import chess.engine
 
-# --- Data Models ---
-class MoveRequest(BaseModel):
-    move: str  # e.g., "e2e4"
-
-class AnalysisLine(BaseModel):
-    pv: List[str]
-    score: str
-    depth: int
-    multipv: int
-
-class BoardStatus(BaseModel):
-    fen: str
-    is_checkmate: bool
-    is_draw: bool
-    turn: str
-
-# --- Engine Management ---
 class EngineCluster:
     def __init__(self):
-        self.stockfish: Optional[chess.engine.AsyncUCIEngine] = None
-        # We maintain the absolute board state here
+        self.stockfish = None
+        self.lc0 = None
         self.board = chess.Board()
+        
+        # 1. Get the absolute path of the 'backend' folder
+        # /Users/domarm/ai-chess-coach/backend
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        
+        # 2. Go up TWO levels to reach /Users/domarm/
+        # Then go into /lc0/build/lc0
+        self.LC0_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "lc0", "build", "lc0"))
+        
+        # 3. Weights stay in the backend folder
+        self.LC0_WEIGHTS = os.path.join(BASE_DIR, "leela_weights.pb.gz")
+        
+        # Log it for peace of mind
+        print(f"🔍 Looking for Lc0 at: {self.LC0_PATH}")
 
     async def start(self):
-        print("🚀 Awakening Stockfish 16.1 on M3 Max...")
-        transport, engine = await chess.engine.popen_uci("stockfish")
+        print("🚀 Awakening Engine Cluster on M3 Max...")
         
-        # Hardware Optimization for M3 Max
-        # 12 Threads (Efficiency + Performance cores), 4GB Hash for deep lookahead
-        await engine.configure({
-            "Threads": 12,
-            "Hash": 4096,
-            "MultiPV": 3
-        })
-        self.stockfish = engine
+        # 1. Initialize Stockfish
+        # Note: We removed MultiPV here because python-chess manages it during analysis
+        _, sf = await chess.engine.popen_uci("stockfish")
+        await sf.configure({"Threads": 12, "Hash": 2048})
+        self.stockfish = sf
 
-    async def stop(self):
-        if self.stockfish:
-            await self.stockfish.quit()
+        # 2. Initialize Lc0 (Strategist)
+        if os.path.exists(self.LC0_PATH):
+            _, l = await chess.engine.popen_uci(self.LC0_PATH)
+            await l.configure({"WeightsFile": self.LC0_WEIGHTS})
+            self.lc0 = l
+            print("🧠 Leela Chess Zero (Metal) is online.")
+        else:
+            print(f"⚠️ Lc0 binary not found at {self.LC0_PATH}")
 
-    async def get_analysis(self) -> List[AnalysisLine]:
-        if not self.stockfish:
-            return []
-        
-        # Analyze for 500ms
-        info = await self.stockfish.analyse(
+    async def get_analysis(self):
+        """
+        Orchestrates parallel analysis. 
+        MultiPV is handled here, which satisfies python-chess.
+        """
+        # Tactical check (Stockfish)
+        sf_task = self.stockfish.analyse(
             self.board, 
-            chess.engine.Limit(time=0.5), 
+            chess.engine.Limit(time=0.3), 
             multipv=3
         )
         
-        return [
-            AnalysisLine(
-                pv=[m.uci() for m in entry.get("pv", [])],
-                score=str(entry["score"].white()),
-                depth=entry.get("depth", 0),
-                multipv=i + 1
-            )
-            for i, entry in enumerate(info)
-        ]
+        # Positional check (Lc0)
+        lc0_task = self.lc0.analyse(
+            self.board, 
+            chess.engine.Limit(nodes=500)
+        )
+        
+        sf_info, lc0_info = await asyncio.gather(sf_task, lc0_task)
+        
+        return {
+            "type": "analysis_update",
+            "fen": self.board.fen(),
+            "stockfish": [
+                {
+                    "pv": [m.uci() for m in entry.get("pv", [])], 
+                    "score": str(entry["score"].white())
+                }
+                for entry in sf_info
+            ],
+            "lc0_suggestion": lc0_info.get("pv", [None])[0].uci() if lc0_info.get("pv") else None
+        }
 
-# --- App Lifecycle ---
 cluster = EngineCluster()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await cluster.start()
     yield
-    await cluster.stop()
+    # Graceful cleanup
+    if cluster.stockfish: await cluster.stockfish.quit()
+    if cluster.lc0: await cluster.lc0.quit()
 
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_methods=["*"], 
+    allow_headers=["*"]
 )
 
-# --- Endpoints ---
-
-@app.get("/status", response_model=BoardStatus)
-async def get_status():
-    return BoardStatus(
-        fen=cluster.board.fen(),
-        is_checkmate=cluster.board.is_checkmate(),
-        is_draw=cluster.board.is_stalemate() or cluster.board.is_insufficient_material(),
-        turn="white" if cluster.board.turn == chess.WHITE else "black"
-    )
-
-@app.post("/move")
-async def make_move(request: MoveRequest):
-    """
-    Updates the backend board state. 
-    This ensures the backend remains the absolute source of truth.
-    """
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
     try:
-        move = chess.Move.from_uci(request.move)
-        if move in cluster.board.legal_moves:
-            cluster.board.push(move)
-            # Trigger immediate analysis of the new position
-            analysis = await cluster.get_analysis()
-            return {
-                "fen": cluster.board.fen(),
-                "analysis": analysis
-            }
-        else:
-            raise HTTPException(status_code=400, detail="Illegal move")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid UCI format")
-
-@app.get("/analyze")
-async def analyze():
-    analysis = await cluster.get_analysis()
-    return {"analysis": analysis}
-
-@app.post("/reset")
-async def reset_board():
-    cluster.board.reset()
-    return {"status": "Board reset", "fen": cluster.board.fen()}
+        # Send the current board state immediately upon connection
+        await websocket.send_text(json.dumps({
+            "type": "init", 
+            "fen": cluster.board.fen()
+        }))
+        
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message["type"] == "move":
+                move_uci = message["move"]
+                try:
+                    move = chess.Move.from_uci(move_uci)
+                    if move in cluster.board.legal_moves:
+                        cluster.board.push(move)
+                        # Push the deep analysis back to the UI
+                        analysis = await cluster.get_analysis()
+                        await websocket.send_text(json.dumps(analysis))
+                    else:
+                        await websocket.send_text(json.dumps({
+                            "type": "error", 
+                            "msg": "Illegal move"
+                        }))
+                except Exception as e:
+                    await websocket.send_text(json.dumps({
+                        "type": "error", 
+                        "msg": str(e)
+                    }))
+                    
+    except WebSocketDisconnect:
+        print("Client disconnected")
