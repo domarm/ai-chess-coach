@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+/* A small reset to ensure our app takes the full screen height */
+@layer base {
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    background-color: var(--color-gray-900);
+  }
+}
