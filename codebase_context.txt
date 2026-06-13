@@ -1,0 +1,423 @@
+import asyncio
+import json
+import os
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import chess
+import chess.engine
+from mlx_lm import load, generate
+
+class EngineCluster:
+    def __init__(self):
+        self.stockfish = None
+        self.lc0 = None
+        self.board = chess.Board()
+        
+        self.llm_model = None
+        self.llm_tokenizer = None
+        
+        # 1. DEDICATED THREAD POOLS: Prevents the LLM from starving the chess logic
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.llm_executor = ThreadPoolExecutor(max_workers=1) 
+        self.gpu_lock = asyncio.Lock()
+        
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self.LC0_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "lc0", "build", "lc0"))
+        self.LC0_WEIGHTS = os.path.join(BASE_DIR, "leela_weights.pb.gz")
+
+    async def start(self):
+        print("🚀 Awakening Engine Cluster on M3 Max...")
+        
+        _, sf = await chess.engine.popen_uci("stockfish")
+        await sf.configure({"Threads": 12, "Hash": 16384})
+        self.stockfish = sf
+
+        if os.path.exists(self.LC0_PATH):
+            _, l = await chess.engine.popen_uci(self.LC0_PATH)
+            await l.configure({"WeightsFile": self.LC0_WEIGHTS})
+            self.lc0 = l
+            print("🧠 Leela Chess Zero (Metal) is online.")
+            
+        loop = asyncio.get_running_loop()
+        def load_llm():
+            print("🗣️ Loading Llama 3.1 8B Instruct (4-bit)...")
+            return load("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+            
+        self.llm_model, self.llm_tokenizer = await loop.run_in_executor(self.llm_executor, load_llm)
+        print("🎙️ Grandmaster Voice is online.")
+
+    async def get_analysis(self):
+        if self.board.is_game_over():
+            outcome = self.board.outcome()
+            return {
+                "type": "game_over",
+                "fen": self.board.fen(),
+                "termination": outcome.termination.name.lower(),
+                "winner": "white" if outcome.winner == chess.WHITE else ("black" if outcome.winner == chess.BLACK else "draw"),
+                "stockfish": [],
+                "lc0_suggestion": None
+            }
+
+        loop = asyncio.get_running_loop()
+
+        sf_task = self.stockfish.analyse(self.board, chess.engine.Limit(time=0.3), multipv=3)
+        
+        async def get_lc0_analysis():
+            async with self.gpu_lock:
+                return await self.lc0.analyse(self.board, chess.engine.Limit(time=0.3))
+                
+        lc0_task = asyncio.create_task(get_lc0_analysis())
+        sf_info, lc0_info = await asyncio.gather(sf_task, lc0_task)
+        
+        def format_response():
+            stockfish_data = []
+            for entry in sf_info:
+                temp_board = self.board.copy()
+                san_pv = []
+                for move in entry.get("pv", []):
+                    try:
+                        san_pv.append(temp_board.san(move))
+                        temp_board.push(move)
+                    except Exception:
+                        san_pv.append(move.uci())
+                
+                stockfish_data.append({
+                    "pv": san_pv, 
+                    "score": str(entry["score"].white()),
+                })
+                
+            lc0_suggestion = None
+            if lc0_info.get("pv"):
+                try:
+                    lc0_suggestion = self.board.san(lc0_info["pv"][0])
+                except Exception:
+                    lc0_suggestion = lc0_info["pv"][0].uci()
+            
+            return {
+                "type": "analysis_update",
+                "fen": self.board.fen(),
+                "stockfish": stockfish_data,
+                "lc0_suggestion": lc0_suggestion
+            }
+            
+        return await loop.run_in_executor(self.executor, format_response)
+
+cluster = EngineCluster()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await cluster.start()
+    yield
+    if cluster.stockfish: await cluster.stockfish.quit()
+    if cluster.lc0: await cluster.lc0.quit()
+    cluster.executor.shutdown(wait=False)
+    cluster.llm_executor.shutdown(wait=False)
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    
+    active_analysis_task = None
+    active_llm_task = None
+    
+    async def generate_commentary(analysis_data, game_pgn):
+        async with cluster.gpu_lock:
+            def run_mlx():
+                top_move = analysis_data["stockfish"][0]["pv"][0] if analysis_data["stockfish"] else "None"
+                
+                # 1. EXPLICIT TURN CALCULATION
+                # This prevents the LLM from confusing White and Black
+                turn_color = "White" if cluster.board.turn == chess.WHITE else "Black"
+                
+                # 2. THE FACT-BASED, RESTRICTIVE PROMPT
+                prompt = (
+                    "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+                    "You are a master chess tactician. Explain the given move strictly based on basic chess principles (e.g., center control, piece development, king safety). "
+                    "CRITICAL RULES: "
+                    "1. DO NOT name specific pawns or squares unless they are explicitly in the move. "
+                    "2. DO NOT output quotation marks. "
+                    "3. Keep it to one short sentence.<|eot_id|>"
+                    "<|start_header_id|>user<|end_header_id|>\n"
+                    f"PGN: {game_pgn}\n"
+                    f"Fact 1: It is currently {turn_color}'s turn to move.\n"
+                    f"Fact 2: The engine recommends {turn_color} plays {top_move}.\n"
+                    f"Strategically, why is {top_move} a good move for {turn_color} here?<|eot_id|>"
+                    "<|start_header_id|>assistant<|end_header_id|>\n"
+                )
+                
+                raw_commentary = generate(cluster.llm_model, cluster.llm_tokenizer, prompt=prompt, max_tokens=45, verbose=False)
+                
+                # 3. PROGRAMMATIC QUOTE STRIPPING
+                # This explicitly removes any floating double/single quotes from the beginning, end, or inside the string
+                cleaned_commentary = raw_commentary.strip().strip('"').strip("'").replace('"', '')
+                
+                return cleaned_commentary
+            
+            commentary = await loop.run_in_executor(cluster.llm_executor, run_mlx)
+            
+            try:
+                await websocket.send_text(json.dumps({"type": "llm_commentary", "text": commentary}))
+            except Exception:
+                pass
+
+    # 1. Update this function to accept the PGN
+    async def run_and_send_analysis(current_pgn):
+        nonlocal active_llm_task
+        try:
+            analysis = await cluster.get_analysis()
+            await websocket.send_text(json.dumps(analysis))
+            
+            if active_llm_task and not active_llm_task.done():
+                return 
+                
+            # Pass the PGN into the LLM generator
+            active_llm_task = asyncio.create_task(generate_commentary(analysis, current_pgn))
+            
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Analysis error: {e}")
+
+    try:
+        await websocket.send_text(json.dumps({"type": "init", "fen": cluster.board.fen()}))
+        
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message["type"] == "move":
+                if active_analysis_task and not active_analysis_task.done():
+                    active_analysis_task.cancel()
+                
+                move_uci = message["move"]
+                
+                # --- EXTRACT THE PGN FROM THE FRONTEND ---
+                incoming_pgn = message.get("pgn", "No history yet.") 
+                
+                def apply_move():
+                    try:
+                        move = chess.Move.from_uci(move_uci)
+                        if move in cluster.board.legal_moves:
+                            cluster.board.push(move)
+                            return True
+                        return False
+                    except ValueError:
+                        return False
+                    
+                is_legal = await loop.run_in_executor(cluster.executor, apply_move)
+                
+                if is_legal:
+                    # Pass the PGN into our analysis orchestrator
+                    active_analysis_task = asyncio.create_task(run_and_send_analysis(incoming_pgn))
+                else:
+                    await websocket.send_text(json.dumps({"type": "error", "msg": "Illegal move"}))
+                    
+    except WebSocketDisconnect:
+        print("Client disconnected")import { useState, useEffect, useCallback, useRef } from 'react';
+
+export interface AnalysisUpdate {
+  type: 'analysis_update';
+  fen: string;
+  stockfish: { pv: string[]; score: string }[];
+  lc0_suggestion: string | null;
+}
+
+export function useChessSocket() {
+  const [analysis, setAnalysis] = useState<AnalysisUpdate | null>(null);
+  const [commentary, setCommentary] = useState<string>("");
+  const [isConnected, setIsConnected] = useState(false);
+  const socketRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    const socket = new WebSocket('ws://localhost:8000/ws');
+    socketRef.current = socket;
+
+    socket.onopen = () => setIsConnected(true);
+    socket.onclose = () => setIsConnected(false);
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'analysis_update') {
+        setAnalysis(data);
+        // Clear the old advice while the coach thinks about the new move
+        setCommentary(""); 
+      } else if (data.type === 'llm_commentary') {
+        setCommentary(data.text);
+      }
+    };
+
+    return () => {
+      socket.close();
+    };
+  }, []);
+
+  const sendMove = useCallback((moveUci: string, currentPgn: string) => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ 
+          type: 'move', 
+          move: moveUci, 
+          pgn: currentPgn 
+      }));
+    }
+  }, []);
+
+  return { analysis, commentary, isConnected, sendMove };
+}import { useState } from 'react';
+import { Chess } from 'chess.js';
+import { Chessboard } from 'react-chessboard';
+import { useChessSocket } from '../hooks/useChessSocket';
+
+export default function ChessTrainer() {
+  const [game, setGame] = useState(new Chess());
+  const { analysis, commentary, isConnected, sendMove } = useChessSocket();
+  
+  const [moveFrom, setMoveFrom] = useState<string | null>(null);
+  const [moveTo, setMoveTo] = useState<string | null>(null);
+  const [showPromotionDialog, setShowPromotionDialog] = useState(false);
+
+  function executeMove(source: string, target: string, promotionPiece?: string) {
+    const gameCopy = new Chess(game.fen());
+    try {
+        const move = gameCopy.move({
+            from: source,
+            to: target,
+            promotion: promotionPiece ?? 'q', 
+        });
+
+        if (move === null) return false;
+        
+        setGame(gameCopy);
+        
+        // --- ADD THE PGN TO THE SEND COMMAND ---
+        sendMove(move.lan, gameCopy.pgn()); 
+        
+        return true;
+    } catch (error) {
+        console.warn("Invalid move caught:", error);
+        return false;
+    }
+  }
+
+  function onDrop({ sourceSquare, targetSquare }: { sourceSquare: string; targetSquare: string | null }) {
+    if (!targetSquare) return false; 
+
+    const possibleMoves = game.moves({ verbose: true });
+    const isPromotion = possibleMoves.some(
+        (m) => m.from === sourceSquare && m.to === targetSquare && m.promotion
+    );
+
+    if (isPromotion) {
+        setMoveFrom(sourceSquare);
+        setMoveTo(targetSquare);
+        setShowPromotionDialog(true);
+        return true; 
+    }
+
+    return executeMove(sourceSquare, targetSquare);
+  }
+
+  function handleCustomPromotion(piece: string) {
+    if (moveFrom && moveTo) {
+        executeMove(moveFrom, moveTo, piece);
+    }
+    setMoveFrom(null);
+    setMoveTo(null);
+    setShowPromotionDialog(false);
+  }
+
+  const boardOptions = {
+    position: game.fen(),
+    onPieceDrop: onDrop,
+    boardWidth: 600,
+    customDarkSquareStyle: { backgroundColor: '#4b5563' },
+    customLightSquareStyle: { backgroundColor: '#e5e7eb' }
+  };
+
+  return (
+    <div className="flex h-screen w-full bg-gray-900 text-gray-100 font-sans p-6 gap-6">
+      
+      {/* Left Column: The Chess Board */}
+      <div className="flex flex-col flex-1 items-center justify-center">
+        <div className="relative w-[600px] h-[600px]">
+            <Chessboard options={boardOptions} />
+            {showPromotionDialog && (
+                <div className="absolute inset-0 z-50 flex items-center justify-center bg-gray-900/70 rounded-lg">
+                    <div className="bg-gray-800 p-6 rounded-2xl shadow-2xl border border-gray-600 flex flex-col items-center gap-4">
+                        <h3 className="text-white font-bold text-lg">Promote Pawn</h3>
+                        <div className="flex gap-4">
+                            {['q', 'r', 'b', 'n'].map((p) => (
+                                <button
+                                    key={p}
+                                    onClick={() => handleCustomPromotion(p)}
+                                    className="w-16 h-16 bg-gray-700 hover:bg-blue-600 transition-colors rounded-xl flex items-center justify-center text-4xl font-bold text-white shadow-lg"
+                                >
+                                    {p === 'q' ? '♕' : p === 'r' ? '♖' : p === 'b' ? '♗' : '♘'}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+      </div>
+
+      {/* Right Column: Analysis & Chat */}
+      <div className="flex flex-col w-96 bg-gray-800 border border-gray-700 rounded-lg shadow-xl overflow-hidden">
+        <div className="bg-gray-950 p-4 border-b border-gray-700">
+            <h2 className="text-xl font-bold text-blue-400">Grandmaster AI</h2>
+            <p className={`text-xs mt-1 ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
+                Engine Cluster: {isConnected ? 'Connected' : 'Offline'}
+            </p>
+        </div>
+        
+        <div className="flex-1 p-4 overflow-y-auto space-y-4">
+            {/* Live Engine Output */}
+            <div className="bg-gray-900 p-3 rounded border border-gray-700">
+                <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2">Tactical (Stockfish)</h3>
+                {analysis?.stockfish.map((line, i) => (
+                    <div key={i} className="text-sm font-mono mb-1 flex justify-between">
+                        <span className="text-blue-300">#{i+1} {line.pv[0]}</span>
+                        <span className="text-gray-400">{line.score}</span>
+                    </div>
+                )) || <div className="text-sm text-gray-600 italic">Waiting for move...</div>}
+            </div>
+
+            <div className="bg-gray-900 p-3 rounded border border-gray-700">
+                <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2">Strategy (Lc0)</h3>
+                <div className="text-lg font-bold text-purple-400">
+                    {analysis?.lc0_suggestion || "---"}
+                </div>
+                <p className="text-[10px] text-gray-500 mt-1 italic">Neural network policy recommendation</p>
+            </div>
+        </div>
+
+        <div className="p-5 bg-gray-900 border-t border-gray-700 min-h-[140px] flex flex-col justify-center">
+    <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-3">Grandmaster Coach</h3>
+    
+    {commentary ? (
+        <p className="text-sm text-gray-200 leading-relaxed border-l-2 border-blue-500 pl-3">
+            {commentary}
+        </p>
+    ) : analysis ? (
+        <div className="flex items-center gap-3 text-gray-500 italic text-sm">
+            <span className="relative flex h-3 w-3">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500"></span>
+            </span>
+            Analyzing position telemetry...
+        </div>
+    ) : (
+        <p className="text-sm text-gray-600 italic">Make a move to begin coaching session.</p>
+    )}
+</div>
+      </div>
+
+    </div>
+  );
+}

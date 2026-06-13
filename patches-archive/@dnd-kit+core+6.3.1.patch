@@ -1,0 +1,43 @@
+diff --git a/node_modules/@dnd-kit/core/dist/core.esm.js b/node_modules/@dnd-kit/core/dist/core.esm.js
+index 1577c25..f2c94f2 100644
+--- a/node_modules/@dnd-kit/core/dist/core.esm.js
++++ b/node_modules/@dnd-kit/core/dist/core.esm.js
+@@ -3421,11 +3421,13 @@ function useDraggable(_ref) {
+       data: dataRef
+     });
+     return () => {
+-      const node = draggableNodes.get(id);
++      queueMicrotask(() => {
++        const node = draggableNodes.get(id);
+ 
+-      if (node && node.key === key) {
+-        draggableNodes.delete(id);
+-      }
++        if (node && node.key === key) {
++          draggableNodes.delete(id);
++        }
++      });
+     };
+   }, // eslint-disable-next-line react-hooks/exhaustive-deps
+   [draggableNodes, id]);
+@@ -3547,11 +3549,15 @@ function useDroppable(_ref) {
+         data: dataRef
+       }
+     });
+-    return () => dispatch({
+-      type: Action.UnregisterDroppable,
+-      key,
+-      id
+-    });
++    return () => {
++      queueMicrotask(() => {
++        dispatch({
++          type: Action.UnregisterDroppable,
++          key,
++          id
++        });
++      });
++    };
+   }, // eslint-disable-next-line react-hooks/exhaustive-deps
+   [id]);
+   useEffect(() => {

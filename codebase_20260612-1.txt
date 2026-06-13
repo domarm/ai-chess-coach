@@ -1,3 +1,372 @@
+___ FILE: ./tsconfig.node.json ---
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["vite.config.ts"]
+}
+-e 
+
+
+___ FILE: ./tsconfig.app.json ---
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "ES2023",
+    "useDefineForClassFields": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "types": ["vite/client"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["src"]
+}
+-e 
+
+
+___ FILE: ./backend/main.py ---
+import asyncio
+import json
+import os
+import re
+from contextlib import asynccontextmanager
+# UPGRADE: Utilize free-threaded sub-interpreter pools for true CPU-bound parallelism
+from concurrent.futures import InterpreterPoolExecutor 
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import chess
+import chess.engine
+from openai import AsyncOpenAI
+
+llm_client = AsyncOpenAI(
+    base_url="http://localhost:8888/v1",
+    api_key="not-needed" 
+)
+
+def format_response_task(fen_string: str, sf_pvs: list, sf_scores: list, lc0_pv_uci: str | None):
+    """
+    Top-level, cross-interpreter safe function.
+    All inputs are primitive types (strings and lists).
+    """
+    import chess 
+    
+    # Reconstruct a lightweight board inside the sub-interpreter to calculate SAN
+    temp_board = chess.Board(fen_string)
+    
+    stockfish_data = []
+    for pv_ucis, score_str in zip(sf_pvs, sf_scores):
+        san_pv = []
+        pv_board = temp_board.copy()
+        
+        for uci in pv_ucis:
+            try:
+                move = chess.Move.from_uci(uci)
+                san_pv.append(pv_board.san(move))
+                pv_board.push(move)
+            except Exception:
+                san_pv.append(uci)
+        
+        stockfish_data.append({
+            "pv": san_pv,
+            "score": score_str
+        })
+        
+    lc0_suggestion = None
+    if lc0_pv_uci:
+        try:
+            move = chess.Move.from_uci(lc0_pv_uci)
+            lc0_suggestion = temp_board.san(move)
+        except Exception:
+            lc0_suggestion = lc0_pv_uci
+            
+    return {
+        "type": "analysis_update",
+        "fen": fen_string,
+        "stockfish": stockfish_data,
+        "lc0_suggestion": lc0_suggestion
+    }
+
+class EngineCluster:
+    def __init__(self):
+        self.stockfish = None
+        self.lc0 = None
+        self.board = chess.Board()
+        # Upgrade to InterpreterPoolExecutor to eliminate GIL contention during string parsing
+        self.executor = InterpreterPoolExecutor(max_workers=2) 
+        
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self.LC0_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "lc0", "build", "lc0"))
+        self.LC0_WEIGHTS = os.path.join(BASE_DIR, "leela_weights.pb.gz")
+
+#... (The remainder of main.py functions normally as the lock architecture has already been removed in Phase 3)
+
+    async def start(self):
+        print("🚀 Awakening Engine Cluster on M3 Max (Free-Threaded)...")
+        _, sf = await chess.engine.popen_uci("stockfish")
+        await sf.configure({"Threads": 12, "Hash": 16384})
+        self.stockfish = sf
+
+        if os.path.exists(self.LC0_PATH):
+            _, l = await chess.engine.popen_uci(self.LC0_PATH)
+            await l.configure({"WeightsFile": self.LC0_WEIGHTS})
+            self.lc0 = l
+            print("🧠 Leela Chess Zero (Metal) is online.")
+
+    async def get_analysis(self):
+        if self.board.is_game_over():
+            outcome = self.board.outcome()
+            return {
+                "type": "game_over",
+                "fen": self.board.fen(),
+                "termination": outcome.termination.name.lower(),
+                "winner": "white" if outcome.winner == chess.WHITE else ("black" if outcome.winner == chess.BLACK else "draw"),
+                "stockfish": [],
+                "lc0_suggestion": None
+            }
+
+        loop = asyncio.get_running_loop()
+        sf_task = self.stockfish.analyse(self.board, chess.engine.Limit(time=5), multipv=3)
+        lc0_task = self.lc0.analyse(self.board, chess.engine.Limit(time=5))
+        sf_info, lc0_info = await asyncio.gather(sf_task, lc0_task)
+        
+        # 1. Extract purely primitive, shareable data
+        fen_string = self.board.fen()
+        
+        sf_pvs = []
+        sf_scores = []
+        for entry in sf_info:
+            sf_pvs.append([m.uci() for m in entry.get("pv", [])])
+            sf_scores.append(str(entry["score"].white()))
+            
+        lc0_pv_uci = None
+        if lc0_info.get("pv"):
+            lc0_pv_uci = lc0_info["pv"][0].uci()
+            
+        # 2. Fire the primitive data across the boundary to the top-level function
+        return await loop.run_in_executor(
+            self.executor, 
+            format_response_task, 
+            fen_string, 
+            sf_pvs, 
+            sf_scores, 
+            lc0_pv_uci
+        )
+
+cluster = EngineCluster()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await cluster.start()
+    yield
+    if cluster.stockfish: await cluster.stockfish.quit()
+    if cluster.lc0: await cluster.lc0.quit()
+    cluster.executor.shutdown(wait=False)
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# --- PHASE 3: THE LLM-MODULO VERIFIER & SSE STREAMING ---
+class CommentaryRequest(BaseModel):
+    fen: str
+    pgn: str
+    top_move: str
+    score: str
+
+def verify_claims(text: str, fen: str, top_move: str) -> bool:
+    """The Hard Critic: Decomposes text and verifies geometric claims against the engine."""
+    board = chess.Board(fen)
+    # Extract all squares mentioned by the LLM (e.g., e4, f6)
+    mentioned_squares = re.findall(r'\b[a-h][1-8]\b', text.lower())
+    
+    # Extract destination square of the suggested move (e.g., 'f5' from 'Bf5')
+    move_dest = re.search(r'[a-h][1-8]', top_move)
+    target_sq = move_dest.group(0) if move_dest else ""
+
+    for sq_str in mentioned_squares:
+        sq_index = chess.parse_square(sq_str)
+        # If the LLM mentions a square that is completely empty AND is not the target of our move...
+        if board.piece_at(sq_index) is None and sq_str != target_sq:
+            print(f"🛑 Hallucination Blocked: LLM claimed piece on empty square {sq_str}")
+            return False # Fails verification
+    return True
+
+@app.post("/api/coach/stream")
+async def coach_stream(request: CommentaryRequest):
+    async def generate_verified_sse():
+        board = chess.Board(request.fen)
+        turn_color = "White" if board.turn == chess.WHITE else "Black"
+
+        # 1. The System Prompt sets the unbreakable behavioral rules
+        system_prompt = """You are an elite Grandmaster Chess Coach.
+RULES:
+1. DO NOT narrate past moves. The user knows how they got here.
+2. Focus ONLY on the CURRENT position and the suggested TOP MOVE.
+3. Explain the strategic purpose of the top move in 2-3 short sentences.
+4. Keep it concise, punchy, and highly analytical."""
+
+        # 2. The User Prompt provides only the exact data needed for this specific evaluation
+        user_prompt = (
+            f"Current Position (FEN): {request.fen}\n"
+            f"Turn: It is {turn_color}'s turn to move.\n"
+            f"Engine Recommendation: The best move is {request.top_move} (Evaluation: {request.score} CP).\n"
+            f"Explain why this specific move is best."
+        )
+
+        try:
+            response = await llm_client.chat.completions.create(
+                model="lucasdino/Qwen2.5-7B-Chess-BestMoveBestLine-SFT",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=1000,
+                temperature=0.2
+            )
+            raw_text = response.choices[0].message.content.strip().strip('"').replace('"', '')
+            
+            # Programmatic Verification Pass
+            if verify_claims(raw_text, request.fen, request.top_move):
+                final_text = raw_text
+            else:
+                # Fallback to deterministic heuristic translation if hallucination detected
+                final_text = f"The engine prioritizes {request.top_move} here to maintain positional tension, evaluating the structure at {request.score} centipawns."
+
+            # Yield SSE formatted data
+            yield f"data: {json.dumps({'type': 'llm_commentary', 'text': final_text})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'msg': str(e)})}\n\n"
+
+    return StreamingResponse(generate_verified_sse(), media_type="text/event-stream")
+
+# --- WEBSOCKET STRICTLY FOR TACTICAL TELEMETRY ---
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    
+    # 1. Establish a strong reference container to prevent opportunistic GC
+    # This set guarantees that all dispatched tasks survive garbage collection sweeps
+    background_tasks = set()
+    
+    # 2. Maintain a distinct reference to the single active task to allow explicit debouncing
+    active_analysis_task = None
+    move_counter = 0 
+
+    async def run_and_send_analysis(current_move):
+        print(f"⏳ Engine cluster analyzing move {current_move}...")
+        try:
+            # The task suspends here, awaiting the InterpreterPoolExecutor
+            analysis = await cluster.get_analysis()
+            print(f"✅ Analysis complete. Payload: {analysis}")
+            
+            # Ensure the evaluated payload corresponds to the most recent board state
+            if move_counter == current_move:
+                await websocket.send_text(json.dumps(analysis))
+                print(f"🚀 Payload successfully transmitted to WebSocket.")
+            else:
+                print(f"⚠️ Discarding obsolete payload for move {current_move}.")
+                
+        except asyncio.CancelledError:
+            # 3. Explicitly capture BaseException-derived cancellations for observability
+            print(f"⚠️ Analysis for move {current_move} was explicitly cancelled.")
+            # Always re-raise CancelledError to allow proper asyncio teardown protocols
+            raise  
+        except Exception as e:
+            print(f"❌ Failed to transmit: {e}")
+
+    try:
+        await websocket.send_text(json.dumps({"type": "init", "fen": cluster.board.fen()}))
+        
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message["type"] == "move":
+                move_counter += 1
+                incoming_pgn = message.get("pgn", "")
+                move_uci = message["move"]
+                
+                print(f"📡 Received move string from UI: '{move_uci}'")
+                
+                # Evaluate the move directly in the main thread (sub-millisecond execution)
+                is_legal = False
+                try:
+                    move = chess.Move.from_uci(move_uci)
+                    if move in cluster.board.legal_moves:
+                        cluster.board.push(move)
+                        is_legal = True
+                except ValueError:
+                    is_legal = False
+                
+                if is_legal:
+                    # 4. Debounce mechanism: Cancel prior analysis to free CPU resources
+                    if active_analysis_task and not active_analysis_task.done():
+                        active_analysis_task.cancel()
+
+                    # 5. Instantiate the task and bind it to a variable
+                    task = asyncio.create_task(run_and_send_analysis(move_counter))
+                    
+                    # 6. Store a strong reference in the set to shield against GC
+                    background_tasks.add(task)
+                    
+                    # 7. Attach a synchronous callback to autonomously discard the reference upon completion
+                    # This prevents the background_tasks set from causing an indefinite memory leak
+                    task.add_done_callback(background_tasks.discard)
+                    
+                    # Track the task globally to manage mid-flight cancellations on the next iteration
+                    active_analysis_task = task
+                else:
+                    print(f"⚠️ Sending error payload back to UI.")
+                    await websocket.send_text(json.dumps({"type": "error", "msg": "Illegal move"}))
+                    
+    except WebSocketDisconnect:
+        # 8. Graceful Teardown: Clean up any remaining background tasks upon client disconnect
+        print(f"🔌 Client disconnected. Terminating active computations.")
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()-e 
+
+
+___ FILE: ./package-lock.json ---
 {
   "name": "ai-chess-coach",
   "version": "0.0.0",
@@ -4045,3 +4414,601 @@
     }
   }
 }
+-e 
+
+
+___ FILE: ./package.json ---
+{
+  "name": "ai-chess-coach",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "chess.js": "^1.4.0",
+    "react": "^18.3.1",
+    "react-chessboard": "^4.7.3",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^4.2.2",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^24.12.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.4.0",
+    "patch-package": "^8.0.1",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.57.0",
+    "vite": "^8.0.1"
+  }
+}
+-e 
+
+
+___ FILE: ./tsconfig.json ---
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+-e 
+
+
+___ FILE: ./eslint.config.js ---
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import tseslint from 'typescript-eslint'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+  },
+])
+-e 
+
+
+___ FILE: ./src/App.tsx ---
+import ChessTrainer from './components/ChessTrainer';
+
+function App() {
+  return (
+    <ChessTrainer />
+  );
+}
+
+export default App;
+-e 
+
+
+___ FILE: ./src/main.tsx ---
+import { createRoot } from 'react-dom/client'
+import App from './App.tsx'
+import './index.css'
+
+// --- REACT 19 DOM LIFECYCLE POLYFILL FOR @DND-KIT ---
+// Rationale: React 19's asynchronous commit phase and DOM reparenting routinely 
+// force the browser to execute releasePointerCapture(), emitting a synthetic 
+// 'pointercancel' event. @dnd-kit's PointerSensor listens for this event and 
+// will silently abort the drag, swallowing the onDragEnd lifecycle.
+// This polyfill intercepts and suppresses synthetic cancellations during active drags.
+
+if (typeof window!== 'undefined') {
+  const originalAddEventListener = EventTarget.prototype.addEventListener;
+  
+  EventTarget.prototype.addEventListener = function (
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: boolean | AddEventListenerOptions
+  ) {
+    if (type === 'pointercancel') {
+      const wrappedListener = function (this: EventTarget, e: Event) {
+        const pointerEvent = e as PointerEvent;
+        
+        // Detect if @dnd-kit is currently engaged in an active drag operation.
+        // During a drag, dnd-kit applies grabbing cursors and specific ARIA attributes
+        // to the document body and the active draggable node.
+        const isActivelyDragging = 
+          document.body.style.cursor === 'grabbing' || 
+          document.body.style.cursor === 'grab' ||
+          document.querySelector('[aria-roledescription="sortable"]')!== null;
+
+        if (isActivelyDragging) {
+          // Suppress the synthetic pointercancel to protect the active drag state
+          // from React 19's DOM reconciliation interrupts.
+          console.debug("🛡️ Suppressed synthetic pointercancel during active drag.");
+          return; 
+        }
+
+        // Pass through legitimate events when no drag is active
+        if (typeof listener === 'function') {
+          return listener.call(this, pointerEvent);
+        } else if (listener && typeof listener === 'object') {
+          return listener.handleEvent(pointerEvent);
+        }
+      };
+      
+      // Attach the wrapped listener instead of the original
+      return originalAddEventListener.call(this, type, wrappedListener, options);
+    }
+    
+    // For all other event types, execute the standard DOM behavior
+    return originalAddEventListener.call(this, type, listener, options);
+  };
+}
+// ----------------------------------------------------
+
+// Initialize the React 19 Fiber Tree without Strict Mode
+createRoot(document.getElementById('root')!).render(
+    <App />
+)-e 
+
+
+___ FILE: ./src/App.css ---
+.counter {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+  margin-bottom: 24px;
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.hero {
+  position: relative;
+
+  .base,
+  .framework,
+  .vite {
+    inset-inline: 0;
+    margin: 0 auto;
+  }
+
+  .base {
+    width: 170px;
+    position: relative;
+    z-index: 0;
+  }
+
+  .framework,
+  .vite {
+    position: absolute;
+  }
+
+  .framework {
+    z-index: 1;
+    top: 34px;
+    height: 28px;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
+      scale(1.4);
+  }
+
+  .vite {
+    z-index: 0;
+    top: 107px;
+    height: 26px;
+    width: auto;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
+      scale(0.8);
+  }
+}
+
+#center {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+  place-content: center;
+  place-items: center;
+  flex-grow: 1;
+
+  @media (max-width: 1024px) {
+    padding: 32px 20px 24px;
+    gap: 18px;
+  }
+}
+
+#next-steps {
+  display: flex;
+  border-top: 1px solid var(--border);
+  text-align: left;
+
+  & > div {
+    flex: 1 1 0;
+    padding: 32px;
+    @media (max-width: 1024px) {
+      padding: 24px 20px;
+    }
+  }
+
+  .icon {
+    margin-bottom: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  @media (max-width: 1024px) {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+#docs {
+  border-right: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+#next-steps ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  margin: 32px 0 0;
+
+  .logo {
+    height: 18px;
+  }
+
+  a {
+    color: var(--text-h);
+    font-size: 16px;
+    border-radius: 6px;
+    background: var(--social-bg);
+    display: flex;
+    padding: 6px 12px;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    transition: box-shadow 0.3s;
+
+    &:hover {
+      box-shadow: var(--shadow);
+    }
+    .button-icon {
+      height: 18px;
+      width: 18px;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+
+    li {
+      flex: 1 1 calc(50% - 8px);
+    }
+
+    a {
+      width: 100%;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+  }
+}
+
+#spacer {
+  height: 88px;
+  border-top: 1px solid var(--border);
+  @media (max-width: 1024px) {
+    height: 48px;
+  }
+}
+
+.ticks {
+  position: relative;
+  width: 100%;
+
+  &::before,
+  &::after {
+    content: '';
+    position: absolute;
+    top: -4.5px;
+    border: 5px solid transparent;
+  }
+
+  &::before {
+    left: 0;
+    border-left-color: var(--border);
+  }
+  &::after {
+    right: 0;
+    border-right-color: var(--border);
+  }
+}
+-e 
+
+
+___ FILE: ./src/index.css ---
+@import "tailwindcss";
+
+/* A small reset to ensure our app takes the full screen height */
+@layer base {
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    background-color: var(--color-gray-900);
+  }
+}
+-e 
+
+
+___ FILE: ./src/components/ChessTrainer.tsx ---
+import { useState, useEffect, useRef } from 'react';
+import { Chess } from 'chess.js';
+import { Chessboard } from 'react-chessboard';
+import { useChessSocket } from '../hooks/useChessSocket';
+import { useChessStore } from '../store';
+
+export default function ChessTrainer() {
+  const [game, setGame] = useState(new Chess());
+  const [commentary, setCommentary] = useState<string>("");
+  const [isThinking, setIsThinking] = useState(false);
+  
+  const { sendMove, isConnected } = useChessSocket();
+  
+  // ---> RESTORED: The high-frequency engine telemetry is back online
+  const backendFen = useChessStore((state) => state.fen);
+  const stockfishData = useChessStore((state) => state.stockfishData);
+  const lc0Suggestion = useChessStore((state) => state.lc0Suggestion);
+
+  const pgnRef = useRef(game.pgn());
+  const pendingMoveRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    pgnRef.current = game.pgn();
+  }, [game]);
+
+  // ---------------------------------------------------------
+  // EFFECT 1: THE SYNCHRONIZER 
+  // ---------------------------------------------------------
+  useEffect(() => {
+    setGame((currentGame) => {
+      if (!backendFen) return currentGame;
+      
+      const localBase = currentGame.fen().split(' ').slice(0, 3).join(' ');
+      const backendBase = backendFen.split(' ').slice(0, 3).join(' ');
+
+      if (localBase === backendBase) {
+        pendingMoveRef.current = null;
+        return currentGame;
+      }
+
+      if (pendingMoveRef.current && localBase === pendingMoveRef.current) {
+        return currentGame;
+      }
+
+      try {
+        const newGame = new Chess(backendFen);
+        newGame.header('SetUp', '1', 'FEN', backendFen);
+        return newGame;
+      } catch(e) {
+        console.error("Fatal Synchronization Error:", e);
+        return currentGame;
+      }
+    });
+  }, [backendFen]);
+
+  // ---------------------------------------------------------
+  // EFFECT 2: THE LLM-MODULO VERIFIER (Server-Sent Events)
+  // ---------------------------------------------------------
+  useEffect(() => {
+    if (stockfishData && stockfishData.length > 0) {
+      const fetchCommentary = async () => {
+        setIsThinking(true);
+        setCommentary(""); 
+        try {
+          const response = await fetch('http://localhost:8000/api/coach/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fen: backendFen,
+              pgn: pgnRef.current, 
+              top_move: stockfishData[0].pv[0], 
+              score: stockfishData[0].score
+            })
+          });
+
+          const reader = response.body?.getReader();
+          const decoder = new TextDecoder();
+          
+          if (reader) {
+            const { value } = await reader.read();
+            if (value) {
+                const chunk = decoder.decode(value);
+                const dataStr = chunk.replace('data: ', '').trim();
+                if (dataStr) {
+                  const data = JSON.parse(dataStr);
+                  if (data.type === 'llm_commentary') setCommentary(data.text);
+                }
+            }
+          }
+        } catch (error) {
+          console.error("SSE Streaming Connection failed:", error);
+        } finally {
+          setIsThinking(false);
+        }
+      };
+      fetchCommentary();
+    }
+  }, [backendFen, stockfishData]); 
+
+  // ---------------------------------------------------------
+  // ACTION: EXECUTE MOVE 
+  // ---------------------------------------------------------
+  function onPieceDrop(sourceSquare: string, targetSquare: string, piece: string) {
+    const gameCopy = new Chess();
+    gameCopy.loadPgn(game.pgn());
+
+    try {
+      const isPromotion =
+        (piece[1] === 'P' && piece[0] === 'w' && sourceSquare[1] === '7' && targetSquare[1] === '8') ||
+        (piece[1] === 'P' && piece[0] === 'b' && sourceSquare[1] === '2' && targetSquare[1] === '1');
+
+      const moveData: { from: string; to: string; promotion?: string } = { 
+        from: sourceSquare, 
+        to: targetSquare 
+      };
+      if (isPromotion) {
+        moveData.promotion = 'q';
+      }
+
+      const move = gameCopy.move(moveData);
+      
+      if (move) {
+        pendingMoveRef.current = gameCopy.fen().split(' ').slice(0, 3).join(' ');
+        setGame(gameCopy);
+        
+        const uciString = move.lan || `${sourceSquare}${targetSquare}${isPromotion ? 'q' : ''}`;
+        sendMove(uciString, gameCopy.pgn());
+        return true; 
+      }
+    } catch (error) {
+      console.warn("Invalid piece drop rejected:", error);
+      return false;
+    }
+    
+    return false;
+  }
+// ---------------------------------------------------------
+  // PIPELINE TRIPWIRES (Diagnostic Logging)
+  // ---------------------------------------------------------
+  useEffect(() => {
+    if (backendFen) {
+      console.log(`[PIPELINE - FRONTEND] Zustand Received FEN:`, backendFen);
+      console.log(`[PIPELINE - FRONTEND] Zustand Received Stockfish Data:`, stockfishData);
+    }
+  }, [backendFen, stockfishData]);
+  // ---------------------------------------------------------
+  // RENDER UI
+  // ---------------------------------------------------------
+  return (
+    <div className="flex flex-col h-screen bg-black text-white p-6">
+      <div className="flex flex-1 gap-8 max-w-7xl mx-auto w-full">
+        
+        {/* LEFT COLUMN: Board & Move History */}
+        <div className="w-[600px] flex-shrink-0 self-start">
+          <div className="mb-4 flex items-center justify-between">
+            <h1 className="text-2xl font-bold">AI Grandmaster Coach</h1>
+            <div className="flex items-center gap-2">
+              <span className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></span>
+              <span className="text-sm font-medium text-gray-300">
+                {isConnected ? 'Engine Online' : 'Disconnected'}
+              </span>
+            </div>
+          </div>
+          
+          <Chessboard 
+            position={game.fen()} 
+            onPieceDrop={onPieceDrop} 
+          />
+
+          {/* ---> Move History UI (Height Increased by 100px) */}
+          <div className="mt-6 bg-gray-950 border border-gray-800 rounded-lg p-4 h-[220px] overflow-y-auto flex flex-col">
+            <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 border-b border-gray-800 pb-2">
+              Move History
+            </h3>
+            <p className="text-sm text-gray-300 font-mono leading-relaxed break-words">
+              {/* Regex strips all metadata bracket tags like [Event "?"] leaving only the moves */}
+              {game.pgn().replace(/\[.*?\]\s*/g, '').trim() || "1. ..."}
+            </p>
+          </div>
+          
+        </div>
+        
+        {/* RIGHT COLUMN: AI Analysis Panels */}
+        {/* Height increased to h-[850px] to match the expanded left column */}
+        <div className="flex flex-col flex-1 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden h-[850px]">
+          <div className="flex-1 p-6 overflow-y-auto">
+            
+            <div className="mb-6">
+              <h2 className="text-lg font-bold mb-3 text-blue-400 border-b border-gray-700 pb-2">⚔️ Tactical (Stockfish)</h2>
+              {stockfishData?.length > 0 ? (
+                stockfishData.map((line, i) => (
+                  <div key={i} className="mb-2 font-mono text-sm text-gray-300">
+                    <span className="text-green-400 font-bold w-12 inline-block">{line.score}</span> 
+                    <span>| {line.pv.join(' ')}</span>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-gray-500 italic">Awaiting tactical telemetry...</p>
+              )}
+            </div>
+
+            <div className="mb-6">
+              <h2 className="text-lg font-bold mb-3 text-purple-400 border-b border-gray-700 pb-2">🧠 Strategy (Lc0)</h2>
+              {lc0Suggestion ? (
+                <div className="font-mono text-sm text-gray-300">
+                  <span className="text-purple-400 font-bold">Top Node:</span> {lc0Suggestion}
+                </div>
+              ) : (
+                <p className="text-sm text-gray-500 italic">Awaiting positional nodes...</p>
+              )}
+            </div>
+
+          </div>
+
+          <div className="p-5 bg-gray-950 border-t border-gray-800 min-h-[140px] flex flex-col justify-center">
+            <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-3">Verified Coach</h3>
+            {isThinking ? (
+               <div className="flex items-center gap-3 text-gray-500 italic text-sm">
+                   <span className="relative flex h-3 w-3">
+                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                     <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500"></span>
+                   </span>
+                   Verifying telemetry...
+               </div>
+            ) : (
+               <p className="text-sm text-gray-200 leading-relaxed border-l-2 border-blue-500 pl-3">
+                 {commentary || "Make a move to begin."}
+               </p>
+            )}
+          </div>
+        </div>
+        
+      </div>
+    </div>
+  );
+}-e 
+
+
