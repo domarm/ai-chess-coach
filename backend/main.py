@@ -15,6 +15,7 @@ import chess.pgn
 import io
 from openai import AsyncOpenAI
 from typing import Optional
+from heuristics import generate_board_facts
 
 llm_client = AsyncOpenAI(
     base_url="http://localhost:8888/v1",
@@ -27,15 +28,21 @@ def format_response_task(fen_string: str, sf_pvs: list, sf_scores: list, lc0_pv_
     All inputs are primitive types (strings and lists).
     """
     import chess 
+    from heuristics import generate_board_facts # Re-imported inside the sub-interpreter scope
     
-    # Reconstruct a lightweight board inside the sub-interpreter to calculate SAN
     temp_board = chess.Board(fen_string)
     
     stockfish_data = []
-    for pv_ucis, score_str in zip(sf_pvs, sf_scores):
+    heuristic_facts = "Facts unavailable."
+
+    for i, (pv_ucis, score_str) in enumerate(zip(sf_pvs, sf_scores)):
         san_pv = []
         pv_board = temp_board.copy()
         
+        # Calculate heuristics for the TOP engine line (index 0)
+        if i == 0 and len(pv_ucis) > 0:
+            heuristic_facts = generate_board_facts(fen_string, pv_ucis[0])
+            
         for uci in pv_ucis:
             try:
                 move = chess.Move.from_uci(uci)
@@ -61,7 +68,8 @@ def format_response_task(fen_string: str, sf_pvs: list, sf_scores: list, lc0_pv_
         "type": "analysis_update",
         "fen": fen_string,
         "stockfish": stockfish_data,
-        "lc0_suggestion": lc0_suggestion
+        "lc0_suggestion": lc0_suggestion,
+        "heuristic_facts": heuristic_facts # <--- NEW DATA IN PAYLOAD
     }
 
 class EngineCluster:
@@ -169,6 +177,7 @@ class CommentaryRequest(BaseModel):
     score: str
     lc0_suggestion: Optional[str] = None
     stockfish_pv: Optional[str] = None
+    heuristic_facts: Optional[str] = None
 
 def verify_claims(text: str, fen: str, top_move: str) -> bool:
     """The Hard Critic: Decomposes text and verifies geometric claims against the engine."""
@@ -195,11 +204,10 @@ async def coach_stream(request: CommentaryRequest):
         turn_color = "White" if board.turn == chess.WHITE else "Black"
         
         # 1. TRANSLATE SAN TO EXPLICIT ENGLISH
-        # Instead of "a3", this generates "Pawn from a2 to a3"
         try:
             move_obj = board.parse_san(request.top_move)
             piece = board.piece_at(move_obj.from_square)
-            piece_name = chess.piece_name(piece.piece_type).title()
+            piece_name = chess.piece_name(piece.piece_type).title() if piece else "Piece"
             from_sq = chess.square_name(move_obj.from_square)
             to_sq = chess.square_name(move_obj.to_square)
             explicit_top_move = f"{piece_name} moves from {from_sq} to {to_sq} (Notation: {request.top_move})"
@@ -209,13 +217,22 @@ async def coach_stream(request: CommentaryRequest):
         # 2. STRICT SYSTEM PROMPT
         system_prompt = """You are an elite Grandmaster Chess Coach.
 RULES:
-1. DO NOT invent piece positions. Base your analysis STRICTLY on the engine evaluations provided.
+1. DO NOT invent piece positions. Base your analysis STRICTLY on the engine evaluations and PROVEN BOARD FACTS provided.
 2. DO NOT narrate past moves. DO NOT write sequences of future moves (e.g. 1...d5 2.cxd6).
-3. Compare the Tactical engine's move with the Positional engine's move.
-4. Keep it to 2-3 concise sentences. Focus on concepts like development, space, and king safety."""
+3. Keep it to 2-3 concise sentences. Focus on concepts like development, space, king safety, and the proven facts."""
 
-        # 3. DUAL-ENGINE USER PROMPT
-        # 3. DUAL-ENGINE USER PROMPT WITH PV FUTURE-SIGHT
+        # ---> NEW: THE MISSING CONSENSUS LOGIC
+        sf_primary_move = request.stockfish_pv.split()[0] if request.stockfish_pv else ""
+        engines_agree = (sf_primary_move == request.lc0_suggestion)
+
+        agreement_context = (
+            "CRITICAL CONTEXT: Both the Tactical (Stockfish) and Positional (Lc0) engines AGREE on this optimal move. "
+            "Your commentary must emphasize how this specific move satisfies both aggressive tactical calculations and deep structural principles."
+        ) if engines_agree else (
+            "CRITICAL CONTEXT: The engines DISAGREE. Contrast Stockfish's sharp tactical choice with Lc0's long-term structural preference."
+        )
+
+        # 3. DUAL-ENGINE USER PROMPT WITH PV FUTURE-SIGHT & HEURISTICS
         lc0_text = f"Leela Chess Zero (Positional) prefers: {request.lc0_suggestion}" if request.lc0_suggestion else "Lc0 data currently unavailable."
         pv_text = f"Stockfish's calculated continuation (PV) is: {request.stockfish_pv}" if request.stockfish_pv else ""
         
@@ -224,7 +241,9 @@ RULES:
             f"Stockfish (Tactical) prefers: {explicit_top_move} (Eval: {request.score} CP)\n"
             f"{pv_text}\n"
             f"{lc0_text}\n\n"
-            f"Based on the Stockfish continuation line, explain the tactical goal of this move. Why does Stockfish prefer it over the Lc0 positional suggestion?"
+            f"PROVEN BOARD FACTS (Use this to guide your analysis!): {request.heuristic_facts}\n\n"
+            f"{agreement_context}\n"
+            f"Based on this data and the provided heuristics, provide concise, expert commentary."
         )
 
         try:
@@ -243,8 +262,11 @@ RULES:
             if verify_claims(raw_text, request.fen, request.top_move):
                 final_text = raw_text
             else:
-                # ---> NEW FALLBACK: Guarantees Lc0 is mentioned if hallucination is blocked
-                final_text = f"Stockfish prefers the tactical tension of {request.top_move}, calculating the line [{request.stockfish_pv}]. Meanwhile, Lc0 evaluates the structure differently and prefers {request.lc0_suggestion}. Eval rests at {request.score}."
+                # ---> REVISED FALLBACK: Intelligently branches based on engine consensus
+                if engines_agree:
+                    final_text = f"A remarkable consensus: Both Stockfish and Lc0 universally agree on {request.top_move}. The deep tactical calculation [{request.stockfish_pv}] perfectly aligns with Lc0's structural principles, solidifying an eval of {request.score}."
+                else:
+                    final_text = f"A clash of styles: Stockfish prefers the tactical tension of {request.top_move}, calculating the line [{request.stockfish_pv}]. Lc0 evaluates the structure differently and prefers {request.lc0_suggestion}. Eval rests at {request.score}."
 
             yield f"data: {json.dumps({'type': 'llm_commentary', 'text': final_text})}\n\n"
             
