@@ -25,3 +25,5 @@ dist-ssr
 backend/leela_weights.pb.gz
 training/*.json
 training/*.jsonl
+data/
+adapters/

@@ -1,0 +1,24 @@
+# The Base Model (Pre-quantized for Apple Silicon MLX)
+model: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+
+# Data formatting
+train: true
+data: "data"
+seed: 42
+
+# LoRA Architecture parameters
+lora_layers: 16
+lora_parameters:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  scale: 10.0
+
+# Training Hyperparameters
+batch_size: 2
+iters: 1000 # 1000 iterations is the sweet spot for style alignment
+learning_rate: 1e-4
+steps_per_report: 50
+steps_per_eval: 200
+save_every: 200
+adapter_path: "adapters" # Where your custom weights will be saved
